@@ -3,8 +3,11 @@ this is a startpoint for adding new features
 """
 
 import json
+import logging
+import threading
 import time
 from datetime import datetime, timedelta
+from email.policy import default
 from typing import Callable, List
 
 import click
@@ -20,7 +23,26 @@ from medihunter_notifiers import pushbullet_notify, pushover_notify, telegram_no
 load_dotenv()
 now = datetime.now()
 now_formatted = now.strftime("%Y-%m-%d")
+class Watchdog:
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self.reset_event = threading.Event()
+        self.thread = None
 
+    def start(self):
+        self.reset_event.set()
+        self.thread = threading.Thread(target=self._watch)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def reset(self):
+        self.reset_event.set()
+
+    def _watch(self):
+        while True:
+            if not self.reset_event.wait(self.timeout):
+                raise TimeoutError("Watchdog timeout occurred")
+            self.reset_event.clear()
 
 def make_duplicate_checker() -> Callable[[Appointment], bool]:
     """Closure which checks if appointment was already found before
@@ -58,7 +80,7 @@ def notify_external_device(message: str, notifier: str, **kwargs):
         gotify_notify(message, title)
 
 def process_appointments(
-    appointments: List[Appointment], iteration_counter: int, notifier: str, **kwargs
+    appointments: List[Appointment], iteration_counter: int, notifier: str, additional_message: str, **kwargs
 ):
 
     applen = len(appointments)
@@ -78,6 +100,7 @@ def process_appointments(
             notification_message += f"{appointment.appointment_datetime} {appointment.doctor_name} {appointment.clinic_name}" +(" (Telefonicznie)\n" if appointment.is_phone_consultation else " (Stacjonarnie)\n")
 
     if notification_message:
+        notification_message = f"{notification_message} - {additional_message}"
         notification_title = kwargs.get("notification_title")
         notify_external_device(
             notification_message, notifier, notification_title=notification_title
@@ -123,6 +146,7 @@ def validate_arguments(**kwargs) -> bool:
 @click.option("--days-ahead", "-j", default=1, show_default=True)
 @click.option("--enable-notifier", "-n", type=click.Choice(["pushbullet", "pushover", "telegram", "xmpp", "gotify"]))
 @click.option("--notification-title", "-t")
+@click.option("--message", "-m", default="", show_default=True, help="Additional message to the notification")
 @click.option("--user", prompt=True, envvar='MEDICOVER_USER')
 @click.password_option(confirmation_prompt=False, envvar='MEDICOVER_PASS')
 @click.option("--disable-phone-search", is_flag=True)
@@ -143,9 +167,10 @@ def find_appointment(
     days_ahead,
     enable_notifier,
     notification_title,
+    message,
     disable_phone_search,
 ):
-
+    logging.basicConfig(filename='error.log', level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
     if end_date:
         start_date_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_date_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -165,52 +190,68 @@ def find_appointment(
         return
 
     med_session.load_search_form()
-
+    info_message = f'{region=}, {bookingtype=}, {specialization=}, {clinic=}, {doctor=}, {start_date=}, {end_date=}, ' \
+                   f'{start_time=}, {end_time=}, {service=}, {interval=}, {days_ahead=}, {enable_notifier=}, ' \
+                   f'{notification_title=}, {disable_phone_search=}'
+    telegram_notify(info_message, notification_title)
+    watchdog = Watchdog(timeout=interval * 60 * 3)
+    watchdog.start()
     while interval > 0 or iteration_counter < 2:
-        appointments = []
-        start_date_param = start_date
-        for _ in range(days_ahead):
-            found_appointments = med_session.search_appointments(
-                region=region,
-                bookingtype=bookingtype,
-                specialization=specialization,
-                clinic=clinic,
-                doctor=doctor,
-                start_date=start_date_param,
-                end_date=end_date,
-                start_time=start_time,
-                end_time=end_time,
-                service=service,
-                disable_phone_search=disable_phone_search
-            )
-
-            if not found_appointments:
-                break
-
-            appointment_datetime = found_appointments[-1].appointment_datetime
-            appointment_datetime = datetime.strptime(
-                appointment_datetime, "%Y-%m-%dT%H:%M:%S"
-            )
-            appointment_datetime = appointment_datetime + timedelta(days=1)
-            start_date_param = appointment_datetime.date().isoformat()
-            appointments.extend(found_appointments)
-
-        if not appointments:
-            click.echo(
-                click.style(
-                    f"(iteration: {iteration_counter}) No results found", fg="yellow"
+        try:
+            appointments = []
+            start_date_param = start_date
+            for _ in range(days_ahead):
+                found_appointments = med_session.search_appointments(
+                    region=region,
+                    bookingtype=bookingtype,
+                    specialization=specialization,
+                    clinic=clinic,
+                    doctor=doctor,
+                    start_date=start_date_param,
+                    end_date=end_date,
+                    start_time=start_time,
+                    end_time=end_time,
+                    service=service,
+                    disable_phone_search=disable_phone_search
                 )
-            )
-        else:
-            process_appointments(
-                appointments,
-                iteration_counter,
-                notifier=enable_notifier,
-                notification_title=notification_title,
-            )
 
-        iteration_counter += 1
-        time.sleep(interval * 60)
+                if not found_appointments:
+                    break
+
+                appointment_datetime = found_appointments[-1].appointment_datetime
+                appointment_datetime = datetime.strptime(
+                    appointment_datetime, "%Y-%m-%dT%H:%M:%S"
+                )
+                appointment_datetime = appointment_datetime + timedelta(days=1)
+                start_date_param = appointment_datetime.date().isoformat()
+                appointments.extend(found_appointments)
+
+            if not appointments:
+                click.echo(
+                    click.style(
+                        f"(iteration: {iteration_counter}) No results found", fg="yellow"
+                    )
+                )
+            else:
+                process_appointments(
+                    appointments,
+                    iteration_counter,
+                    notifier=enable_notifier,
+                    notification_title=notification_title,
+                    additional_message=message
+                )
+
+            iteration_counter += 1
+            time.sleep(interval * 60)
+            watchdog.reset()
+        except Exception:
+            logging.exception(f"An error occurred for configuration: {info_message}")
+            time.sleep(interval * 60)
+            if med_session := login(user, password):
+                med_session.load_search_form()
+                watchdog.reset()
+            else:
+                raise
 
 
 @click.command()
